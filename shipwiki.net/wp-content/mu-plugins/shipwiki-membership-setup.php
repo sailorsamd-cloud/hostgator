@@ -2,7 +2,7 @@
 /**
  * Plugin Name: ShipWiki Membership Setup
  * Description: Applies and enforces registration, forum, and membership settings for shipwiki.net.
- * Version: 1.2.0
+ * Version: 1.2.1
  *
  * @package ShipWiki
  */
@@ -17,7 +17,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 final class ShipWiki_Membership_Setup {
 
 	const OPTION_KEY     = 'shipwiki_membership_config';
-	const CONFIG_VERSION = '1.2.0';
+		const CONFIG_VERSION = '1.2.1';
 	const DELETE_BATCH   = 50;
 
 	/**
@@ -30,6 +30,7 @@ final class ShipWiki_Membership_Setup {
 		add_action( 'template_redirect', array( __CLASS__, 'gate_forum_for_unapproved_users' ), 5 );
 		add_action( 'admin_enqueue_scripts', array( __CLASS__, 'enqueue_admin_scripts' ) );
 		add_action( 'wp_ajax_shipwiki_bulk_delete_users', array( __CLASS__, 'ajax_bulk_delete_users' ) );
+		add_action( 'admin_post_shipwiki_flush_um_cache', array( __CLASS__, 'handle_flush_um_cache' ) );
 	}
 
 	/**
@@ -183,6 +184,9 @@ JS
 			<?php if ( isset( $_GET['applied'] ) ) : // phpcs:ignore WordPress.Security.NonceVerification.Recommended ?>
 				<div class="notice notice-success is-dismissible"><p>Configuration applied to WordPress, Ultimate Member, Tutor, and wpForo.</p></div>
 			<?php endif; ?>
+			<?php if ( isset( $_GET['um_cache_cleared'] ) ) : // phpcs:ignore WordPress.Security.NonceVerification.Recommended ?>
+				<div class="notice notice-success is-dismissible"><p>Ultimate Member user count cache cleared.</p></div>
+			<?php endif; ?>
 			<?php if ( isset( $_GET['error'] ) && 'keys' === $_GET['error'] ) : // phpcs:ignore WordPress.Security.NonceVerification.Recommended ?>
 				<div class="notice notice-error is-dismissible"><p>Enter both reCAPTCHA v2 site key and secret key before applying.</p></div>
 			<?php endif; ?>
@@ -314,6 +318,16 @@ JS
 
 			<progress id="shipwiki-bulk-delete-progress" max="100" value="0" style="width:100%;max-width:720px;height:18px;"></progress>
 			<div id="shipwiki-bulk-delete-log" style="margin-top:1em;max-width:720px;max-height:240px;overflow:auto;background:#fff;border:1px solid #ccd0d4;padding:10px;font-family:monospace;font-size:12px;"></div>
+
+			<hr />
+
+			<h2>Ultimate Member count cache</h2>
+			<p>The Ultimate Member dashboard caches user totals for up to an hour. After bulk delete it may still show the old count (e.g. 2627) even though users are gone. WordPress → <strong>Users</strong> shows the real count.</p>
+			<form method="post" action="<?php echo esc_url( admin_url( 'admin-post.php' ) ); ?>">
+				<?php wp_nonce_field( 'shipwiki_flush_um_cache' ); ?>
+				<input type="hidden" name="action" value="shipwiki_flush_um_cache" />
+				<?php submit_button( 'Clear Ultimate Member user count cache', 'secondary', 'submit', false ); ?>
+			</form>
 		</div>
 		<?php
 	}
@@ -428,6 +442,10 @@ JS
 		$total     = self::count_all_users();
 		$progress  = $total > 0 ? (int) round( ( ( $total - $remaining ) / $total ) * 100 ) : 100;
 
+		if ( 0 === $remaining ) {
+			self::flush_um_user_count_caches();
+		}
+
 		wp_send_json_success(
 			array(
 				'message'   => sprintf(
@@ -442,6 +460,43 @@ JS
 				'progress'  => min( 100, $progress ),
 			)
 		);
+	}
+
+	/**
+	 * Clear Ultimate Member cached dashboard user counts.
+	 */
+	public static function flush_um_user_count_caches() {
+		$statuses = array(
+			'approved',
+			'awaiting_admin_review',
+			'awaiting_email_confirmation',
+			'inactive',
+			'rejected',
+			'pending_dot',
+			'unassigned',
+		);
+
+		foreach ( $statuses as $status ) {
+			delete_transient( "um_count_users_{$status}" );
+		}
+
+		delete_transient( 'um_count_users_all' );
+		do_action( 'um_flush_user_status_cache' );
+	}
+
+	/**
+	 * Manual UM cache clear from admin UI.
+	 */
+	public static function handle_flush_um_cache() {
+		if ( ! current_user_can( 'manage_options' ) ) {
+			wp_die( esc_html__( 'Unauthorized', 'default' ) );
+		}
+		check_admin_referer( 'shipwiki_flush_um_cache' );
+
+		self::flush_um_user_count_caches();
+
+		wp_safe_redirect( admin_url( 'tools.php?page=shipwiki-membership-setup&um_cache_cleared=1' ) );
+		exit;
 	}
 
 	/**
