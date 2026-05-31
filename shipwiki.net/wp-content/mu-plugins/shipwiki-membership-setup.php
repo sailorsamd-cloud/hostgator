@@ -2,7 +2,7 @@
 /**
  * Plugin Name: ShipWiki Membership Setup
  * Description: Applies and enforces registration, forum, and membership settings for shipwiki.net.
- * Version: 1.0.0
+ * Version: 1.1.0
  *
  * @package ShipWiki
  */
@@ -16,8 +16,9 @@ if ( ! defined( 'ABSPATH' ) ) {
  */
 final class ShipWiki_Membership_Setup {
 
-	const OPTION_KEY   = 'shipwiki_membership_config';
-	const CONFIG_VERSION = '1.0.0';
+	const OPTION_KEY     = 'shipwiki_membership_config';
+	const CONFIG_VERSION = '1.1.0';
+	const DELETE_BATCH   = 50;
 
 	/**
 	 * Bootstrap hooks.
@@ -27,6 +28,96 @@ final class ShipWiki_Membership_Setup {
 		add_action( 'admin_post_shipwiki_save_membership_config', array( __CLASS__, 'handle_save' ) );
 		add_action( 'admin_post_shipwiki_apply_membership_config', array( __CLASS__, 'handle_apply' ) );
 		add_action( 'template_redirect', array( __CLASS__, 'gate_forum_for_unapproved_users' ), 5 );
+		add_action( 'admin_enqueue_scripts', array( __CLASS__, 'enqueue_admin_scripts' ) );
+		add_action( 'wp_ajax_shipwiki_bulk_delete_users', array( __CLASS__, 'ajax_bulk_delete_users' ) );
+	}
+
+	/**
+	 * @param string $hook Admin page hook.
+	 */
+	public static function enqueue_admin_scripts( $hook ) {
+		if ( 'tools_page_shipwiki-membership-setup' !== $hook ) {
+			return;
+		}
+
+		wp_register_script( 'shipwiki-membership-admin', false, array( 'jquery' ), self::CONFIG_VERSION, true );
+		wp_enqueue_script( 'shipwiki-membership-admin' );
+		wp_add_inline_script(
+			'shipwiki-membership-admin',
+			'var shipwikiBulkDelete = ' . wp_json_encode(
+				array(
+					'ajaxUrl' => admin_url( 'admin-ajax.php' ),
+					'nonce'   => wp_create_nonce( 'shipwiki_bulk_delete_users' ),
+				)
+			) . ';',
+			'before'
+		);
+		wp_add_inline_script(
+			'shipwiki-membership-admin',
+			<<<'JS'
+jQuery(function ($) {
+	var $btn = $('#shipwiki-start-bulk-delete');
+	var $progress = $('#shipwiki-bulk-delete-progress');
+	var $log = $('#shipwiki-bulk-delete-log');
+	var $confirm = $('#shipwiki-bulk-delete-confirm');
+
+	if (!$btn.length) {
+		return;
+	}
+
+	function logLine(message) {
+		$log.append($('<div/>').text(message));
+		$log.scrollTop($log[0].scrollHeight);
+	}
+
+	function runBatch() {
+		$.post(shipwikiBulkDelete.ajaxUrl, {
+			action: 'shipwiki_bulk_delete_users',
+			nonce: shipwikiBulkDelete.nonce
+		}).done(function (response) {
+			if (!response || !response.success) {
+				logLine((response && response.data && response.data.message) ? response.data.message : 'Delete batch failed.');
+				$btn.prop('disabled', false);
+				return;
+			}
+
+			logLine(response.data.message);
+
+			if (response.data.remaining > 0) {
+				$progress.val(response.data.progress);
+				runBatch();
+				return;
+			}
+
+			$progress.val(100);
+			logLine('Finished. Remaining non-admin users: ' + response.data.remaining);
+			$btn.prop('disabled', false);
+			$('#shipwiki-deletable-count').text(response.data.remaining);
+		}).fail(function () {
+			logLine('Request failed. Try again.');
+			$btn.prop('disabled', false);
+		});
+	}
+
+	$btn.on('click', function () {
+		if ($confirm.val() !== 'DELETE ALL NON-ADMIN USERS') {
+			window.alert('Type DELETE ALL NON-ADMIN USERS in the confirmation box first.');
+			return;
+		}
+
+		if (!window.confirm('This permanently deletes every user except Administrators. Continue?')) {
+			return;
+		}
+
+		$btn.prop('disabled', true);
+		$log.empty();
+		$progress.val(0);
+		logLine('Starting bulk delete...');
+		runBatch();
+	});
+});
+JS
+		);
 	}
 
 	/**
@@ -176,8 +267,183 @@ final class ShipWiki_Membership_Setup {
 				<li><strong>CAPTCHA 4WP:</strong> registration/login enabled, fail if captcha missing</li>
 			</ul>
 			<p><strong>Manual step still required:</strong> In Ultimate Member → User Roles, set <em>Access Permissions</em> so restricted pages and forum require an approved (or paid) role.</p>
+
+			<hr />
+
+			<h2>Bulk delete fake users</h2>
+			<p>Deletes <strong>all users except Administrators</strong> in batches of <?php echo (int) self::DELETE_BATCH; ?>. Posts/content owned by deleted users are reassigned to the first administrator account.</p>
+
+			<?php
+			$admin_users      = self::get_administrator_users();
+			$deletable_count  = self::count_deletable_users();
+			$total_users      = self::count_all_users();
+			?>
+
+			<table class="widefat striped" style="max-width:720px;margin-bottom:1em;">
+				<tbody>
+					<tr><th scope="row">Total users</th><td><?php echo (int) $total_users; ?></td></tr>
+					<tr><th scope="row">Administrators kept</th><td><?php echo (int) count( $admin_users ); ?></td></tr>
+					<tr><th scope="row">Users to delete</th><td id="shipwiki-deletable-count"><?php echo (int) $deletable_count; ?></td></tr>
+				</tbody>
+			</table>
+
+			<?php if ( ! empty( $admin_users ) ) : ?>
+				<p><strong>These administrator accounts will be kept:</strong></p>
+				<ul style="list-style:disc;padding-left:1.5em;">
+					<?php foreach ( $admin_users as $admin_user ) : ?>
+						<li>
+							<?php echo esc_html( $admin_user->user_login ); ?>
+							(<?php echo esc_html( $admin_user->user_email ); ?>, ID <?php echo (int) $admin_user->ID; ?>)
+						</li>
+					<?php endforeach; ?>
+				</ul>
+			<?php else : ?>
+				<div class="notice notice-error inline"><p>No administrator accounts found. Bulk delete is disabled for safety.</p></div>
+			<?php endif; ?>
+
+			<p>
+				<label for="shipwiki-bulk-delete-confirm"><strong>Type exactly:</strong> <code>DELETE ALL NON-ADMIN USERS</code></label><br />
+				<input type="text" id="shipwiki-bulk-delete-confirm" class="regular-text" autocomplete="off" />
+			</p>
+
+			<p>
+				<button type="button" class="button button-secondary" id="shipwiki-start-bulk-delete" <?php disabled( empty( $admin_users ) || $deletable_count < 1 ); ?>>
+					Delete all non-admin users
+				</button>
+			</p>
+
+			<progress id="shipwiki-bulk-delete-progress" max="100" value="0" style="width:100%;max-width:720px;height:18px;"></progress>
+			<div id="shipwiki-bulk-delete-log" style="margin-top:1em;max-width:720px;max-height:240px;overflow:auto;background:#fff;border:1px solid #ccd0d4;padding:10px;font-family:monospace;font-size:12px;"></div>
 		</div>
 		<?php
+	}
+
+	/**
+	 * @return \WP_User[]
+	 */
+	public static function get_administrator_users() {
+		return get_users(
+			array(
+				'role'    => 'administrator',
+				'orderby' => 'ID',
+				'order'   => 'ASC',
+			)
+		);
+	}
+
+	/**
+	 * @return int[]
+	 */
+	public static function get_administrator_user_ids() {
+		return array_map(
+			'intval',
+			wp_list_pluck( self::get_administrator_users(), 'ID' )
+		);
+	}
+
+	/**
+	 * @return int
+	 */
+	public static function count_all_users() {
+		global $wpdb;
+		return (int) $wpdb->get_var( "SELECT COUNT(ID) FROM {$wpdb->users}" );
+	}
+
+	/**
+	 * @return int
+	 */
+	public static function count_deletable_users() {
+		global $wpdb;
+
+		$admin_ids = self::get_administrator_user_ids();
+		if ( empty( $admin_ids ) ) {
+			return 0;
+		}
+
+		$placeholders = implode( ',', array_fill( 0, count( $admin_ids ), '%d' ) );
+		$sql          = "SELECT COUNT(ID) FROM {$wpdb->users} WHERE ID NOT IN ($placeholders)";
+		// phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared
+		return (int) $wpdb->get_var( $wpdb->prepare( $sql, $admin_ids ) );
+	}
+
+	/**
+	 * @param int $limit Batch size.
+	 * @return int[]
+	 */
+	public static function get_next_deletable_user_ids( $limit = self::DELETE_BATCH ) {
+		global $wpdb;
+
+		$admin_ids = self::get_administrator_user_ids();
+		if ( empty( $admin_ids ) ) {
+			return array();
+		}
+
+		$placeholders = implode( ',', array_fill( 0, count( $admin_ids ), '%d' ) );
+		$sql          = "SELECT ID FROM {$wpdb->users} WHERE ID NOT IN ($placeholders) ORDER BY ID ASC LIMIT %d";
+		$args         = array_merge( $admin_ids, array( (int) $limit ) );
+		// phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared
+		$ids = $wpdb->get_col( $wpdb->prepare( $sql, $args ) );
+
+		return array_map( 'intval', $ids );
+	}
+
+	/**
+	 * AJAX batch delete handler.
+	 */
+	public static function ajax_bulk_delete_users() {
+		if ( ! current_user_can( 'delete_users' ) || ! current_user_can( 'manage_options' ) ) {
+			wp_send_json_error( array( 'message' => 'Unauthorized.' ), 403 );
+		}
+
+		check_ajax_referer( 'shipwiki_bulk_delete_users', 'nonce' );
+
+		if ( empty( self::get_administrator_user_ids() ) ) {
+			wp_send_json_error( array( 'message' => 'No administrator accounts found. Aborting.' ), 400 );
+		}
+
+		if ( ! function_exists( 'wp_delete_user' ) ) {
+			require_once ABSPATH . 'wp-admin/includes/user.php';
+		}
+
+		@set_time_limit( 120 );
+
+		$admin_ids = self::get_administrator_user_ids();
+		$reassign  = (int) $admin_ids[0];
+		$user_ids  = self::get_next_deletable_user_ids( self::DELETE_BATCH );
+		$deleted   = 0;
+		$failed    = 0;
+
+		foreach ( $user_ids as $user_id ) {
+			if ( in_array( $user_id, $admin_ids, true ) ) {
+				continue;
+			}
+
+			$result = wp_delete_user( $user_id, $reassign );
+			if ( $result ) {
+				++$deleted;
+			} else {
+				++$failed;
+			}
+		}
+
+		$remaining = self::count_deletable_users();
+		$total     = self::count_all_users();
+		$progress  = $total > 0 ? (int) round( ( ( $total - $remaining ) / $total ) * 100 ) : 100;
+
+		wp_send_json_success(
+			array(
+				'message'   => sprintf(
+					'Deleted %1$d users this batch (%2$d failed). Remaining: %3$d.',
+					$deleted,
+					$failed,
+					$remaining
+				),
+				'deleted'   => $deleted,
+				'failed'    => $failed,
+				'remaining' => $remaining,
+				'progress'  => min( 100, $progress ),
+			)
+		);
 	}
 
 	/**
