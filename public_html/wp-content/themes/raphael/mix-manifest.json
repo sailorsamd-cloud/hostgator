@@ -1,0 +1,14 @@
+{
+    "/assets/css/head.css": "/assets/css/head.css",
+    "/assets/css/home.css": "/assets/css/home.css",
+    "/assets/css/category.css": "/assets/css/category.css",
+    "/assets/css/single-product.css": "/assets/css/single-product.css",
+    "/assets/css/blog.css": "/assets/css/blog.css",
+    "/assets/css/account.css": "/assets/css/account.css",
+    "/assets/css/account-cart.css": "/assets/css/account-cart.css",
+    "/js/script.js": "/js/script.js",
+    "/js/header.js": "/js/header.js",
+    "/js/home.js": "/js/home.js",
+    "/js/single_product.js": "/js/single_product.js",
+    "/js/blog.js": "/js/blog.js"
+}

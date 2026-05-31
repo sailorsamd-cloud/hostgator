@@ -1,0 +1,13 @@
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# WordPress secrets & server-only files
+wp-config.php
+.htaccess
+
+# Logs
+*.log
+error_log

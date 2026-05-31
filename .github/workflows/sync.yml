@@ -1,20 +1,60 @@
-name: Sync to HostGator
+name: Deploy Themes to HostGator
+
 on:
   push:
     branches:
       - main
+    paths:
+      - 'public_html/wp-content/themes/**'
+      - 'shipwiki.net/wp-content/themes/**'
+      - '.github/workflows/sync.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: hostgator-theme-deploy-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  web-deploy:
-    name: Deploy and Sync Files
+  deploy-yourandmyshop:
+    name: Deploy yourandmyshop.com themes
     runs-on: ubuntu-latest
     steps:
     - name: Get latest code
       uses: actions/checkout@v4
-    
-    - name: Sync files to HostGator via FTP
+
+    - name: Sync themes to public_html
       uses: SamKirkland/FTP-Deploy-Action@v4.3.5
       with:
         server: ${{ secrets.FTP_SERVER }}
         username: ${{ secrets.FTP_USERNAME }}
         password: ${{ secrets.FTP_PASSWORD }}
-        server-dir: ./
+        local-dir: ./public_html/wp-content/themes/
+        server-dir: public_html/wp-content/themes/
+        exclude: |
+          **/.git*
+          **/.git*/**
+          **/node_modules/**
+          **/*.log
+          **/error_log
+
+  deploy-shipwiki:
+    name: Deploy shipwiki.net themes
+    runs-on: ubuntu-latest
+    steps:
+    - name: Get latest code
+      uses: actions/checkout@v4
+
+    - name: Sync themes to shipwiki.net
+      uses: SamKirkland/FTP-Deploy-Action@v4.3.5
+      with:
+        server: ${{ secrets.FTP_SERVER }}
+        username: ${{ secrets.FTP_USERNAME }}
+        password: ${{ secrets.FTP_PASSWORD }}
+        local-dir: ./shipwiki.net/wp-content/themes/
+        server-dir: shipwiki.net/wp-content/themes/
+        exclude: |
+          **/.git*
+          **/.git*/**
+          **/node_modules/**
+          **/*.log
+          **/error_log
