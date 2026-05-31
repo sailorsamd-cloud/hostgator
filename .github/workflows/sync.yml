@@ -7,6 +7,7 @@ on:
     paths:
       - 'public_html/wp-content/themes/**'
       - 'shipwiki.net/wp-content/themes/**'
+      - 'shipwiki.net/wp-content/mu-plugins/**'
       - '.github/workflows/sync.yml'
   workflow_dispatch:
 
@@ -37,7 +38,7 @@ jobs:
           **/*.log
           **/error_log
 
-  deploy-shipwiki:
+  deploy-shipwiki-themes:
     name: Deploy shipwiki.net themes
     runs-on: ubuntu-latest
     steps:
@@ -56,5 +57,26 @@ jobs:
           **/.git*
           **/.git*/**
           **/node_modules/**
+          **/*.log
+          **/error_log
+
+  deploy-shipwiki-mu-plugins:
+    name: Deploy shipwiki.net mu-plugins
+    runs-on: ubuntu-latest
+    steps:
+    - name: Get latest code
+      uses: actions/checkout@v4
+
+    - name: Sync mu-plugins to shipwiki.net
+      uses: SamKirkland/FTP-Deploy-Action@v4.3.5
+      with:
+        server: ${{ secrets.FTP_SERVER }}
+        username: ${{ secrets.FTP_USERNAME }}
+        password: ${{ secrets.FTP_PASSWORD }}
+        local-dir: ./shipwiki.net/wp-content/mu-plugins/
+        server-dir: shipwiki.net/wp-content/mu-plugins/
+        exclude: |
+          **/.git*
+          **/.git*/**
           **/*.log
           **/error_log
