@@ -2,7 +2,7 @@
 /**
  * Plugin Name: ShipWiki Membership Setup
  * Description: Applies and enforces registration, forum, and membership settings for shipwiki.net.
- * Version: 1.2.1
+ * Version: 1.3.0
  *
  * @package ShipWiki
  */
@@ -17,7 +17,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 final class ShipWiki_Membership_Setup {
 
 	const OPTION_KEY     = 'shipwiki_membership_config';
-		const CONFIG_VERSION = '1.2.1';
+	const CONFIG_VERSION = '1.3.0';
 	const DELETE_BATCH   = 50;
 
 	/**
@@ -194,6 +194,8 @@ JS
 			<?php if ( $applied_at ) : ?>
 				<p><strong>Last applied:</strong> <?php echo esc_html( wp_date( 'Y-m-d H:i:s', $applied_at ) ); ?></p>
 			<?php endif; ?>
+
+			<?php self::render_security_audit_panel( $config ); ?>
 
 			<form method="post" action="<?php echo esc_url( admin_url( 'admin-post.php' ) ); ?>">
 				<?php wp_nonce_field( 'shipwiki_membership_config' ); ?>
@@ -835,10 +837,276 @@ JS
 
 		$status = get_user_meta( $user_id, 'account_status', true );
 		if ( empty( $status ) ) {
-			$status = 'approved';
+			return false;
 		}
 
 		return 'approved' === $status;
+	}
+
+	/**
+	 * Run registration security checks against saved config and live plugin options.
+	 *
+	 * @param array<string, mixed> $config Saved config.
+	 * @return array<int, array{severity: string, label: string, detail: string}>
+	 */
+	public static function run_security_audit( array $config ) {
+		$findings = array();
+
+		$add = static function ( $severity, $label, $detail ) use ( &$findings ) {
+			$findings[] = array(
+				'severity' => $severity,
+				'label'    => $label,
+				'detail'   => $detail,
+			);
+		};
+
+		if ( empty( $config['recaptcha_site_key'] ) || empty( $config['recaptcha_secret_key'] ) ) {
+			$add( 'error', 'reCAPTCHA keys not saved', 'Enter both site and secret keys below, then click Apply configuration.' );
+		} else {
+			$add( 'ok', 'reCAPTCHA keys saved', 'Site and secret keys are stored in ShipWiki settings.' );
+		}
+
+		if ( empty( $config['applied_at'] ) ) {
+			$add( 'error', 'Configuration never applied', 'Click Apply configuration after saving reCAPTCHA keys.' );
+		} elseif ( ( time() - (int) $config['applied_at'] ) > ( 30 * DAY_IN_SECONDS ) ) {
+			$add(
+				'warning',
+				'Configuration not applied recently',
+				'Last applied ' . wp_date( 'Y-m-d', (int) $config['applied_at'] ) . '. Re-apply if plugin settings may have changed.'
+			);
+		} else {
+			$add( 'ok', 'Configuration applied recently', 'Last applied ' . wp_date( 'Y-m-d H:i:s', (int) $config['applied_at'] ) . '.' );
+		}
+
+		if ( 'approved' === ( $config['um_registration_status'] ?? '' ) ) {
+			$add( 'error', 'ShipWiki set to auto-approve registrations', 'Change Ultimate Member registration status to email activation or admin review.' );
+		} else {
+			$add( 'ok', 'ShipWiki registration status', 'Saved setting: ' . (string) ( $config['um_registration_status'] ?? 'checkmail' ) . '.' );
+		}
+
+		if ( empty( $config['block_forum_until_approved'] ) ) {
+			$add( 'warning', 'Forum gate disabled in ShipWiki', 'Enable “Block /forum/ until Ultimate Member account is approved” below.' );
+		} else {
+			$add( 'ok', 'Forum gate enabled', 'Unapproved users are redirected away from /forum/.' );
+		}
+
+		if ( ! function_exists( 'UM' ) ) {
+			$add( 'error', 'Ultimate Member not loaded', 'Ultimate Member plugin must be active.' );
+		} else {
+			$role_slug = $config['default_wp_role'] ?? 'subscriber';
+			$role_meta = get_option( 'um_role_' . $role_slug . '_meta', array() );
+			if ( ! is_array( $role_meta ) ) {
+				$role_meta = array();
+			}
+			$live_status = $role_meta['_um_status'] ?? '';
+			if ( 'approved' === $live_status ) {
+				$add(
+					'error',
+					'Ultimate Member role auto-approves new users',
+					'Role "' . $role_slug . '" has Registration status = Auto approve. Change it in Ultimate Member → User Roles.'
+				);
+			} elseif ( empty( $live_status ) ) {
+				$add(
+					'warning',
+					'Ultimate Member role registration status unset',
+					'Role "' . $role_slug . '" has no _um_status. Click Apply configuration or set it manually.'
+				);
+			} elseif ( $live_status !== ( $config['um_registration_status'] ?? '' ) ) {
+				$add(
+					'warning',
+					'Ultimate Member role status differs from ShipWiki',
+					'Live role status is "' . $live_status . '" but ShipWiki saved "' . (string) ( $config['um_registration_status'] ?? '' ) . '". Click Apply configuration.'
+				);
+			} else {
+				$add( 'ok', 'Ultimate Member role registration status', 'Role "' . $role_slug . '" requires "' . $live_status . '".' );
+			}
+
+			$um_recaptcha_on = (bool) UM()->options()->get( 'g_recaptcha_status' );
+			$um_site_key     = UM()->options()->get( 'g_recaptcha_sitekey' ) ?: UM()->options()->get( 'g_reCAPTCHA_site_key' );
+			$um_secret_key   = UM()->options()->get( 'g_recaptcha_secretkey' ) ?: UM()->options()->get( 'g_reCAPTCHA_secret_key' );
+			if ( ! $um_recaptcha_on || empty( $um_site_key ) || empty( $um_secret_key ) ) {
+				$add( 'error', 'Ultimate Member reCAPTCHA not fully enabled', 'UM global reCAPTCHA is off or keys are missing. Click Apply configuration.' );
+			} else {
+				$add( 'ok', 'Ultimate Member global reCAPTCHA', 'Enabled with keys configured.' );
+			}
+		}
+
+		if ( ! function_exists( 'is_plugin_active' ) ) {
+			require_once ABSPATH . 'wp-admin/includes/plugin.php';
+		}
+		if ( is_plugin_active( 'um-recaptcha/um-recaptcha.php' ) ) {
+			$add( 'ok', 'UM reCAPTCHA extension active', 'Server-side captcha validation is available on UM forms.' );
+		} else {
+			$add( 'error', 'UM reCAPTCHA extension inactive', 'Activate “Ultimate Member - Google reCAPTCHA” (um-recaptcha) plugin.' );
+		}
+
+		$register_forms = get_posts(
+			array(
+				'post_type'      => 'um_form',
+				'posts_per_page' => -1,
+				'post_status'    => 'publish',
+			)
+		);
+		$forms_without_captcha = array();
+		$register_form_count   = 0;
+		foreach ( $register_forms as $form ) {
+			if ( 'register' !== get_post_meta( $form->ID, '_um_mode', true ) ) {
+				continue;
+			}
+			++$register_form_count;
+			if ( ! get_post_meta( $form->ID, '_um_register_g_recaptcha_status', true ) ) {
+				$forms_without_captcha[] = $form->post_title . ' (ID ' . $form->ID . ')';
+			}
+		}
+		if ( 0 === $register_form_count ) {
+			$add( 'warning', 'No Ultimate Member register forms found', 'Publish at least one UM register form on /join-us/.' );
+		} elseif ( ! empty( $forms_without_captcha ) ) {
+			$add(
+				'error',
+				'Register form(s) missing reCAPTCHA',
+				implode( ', ', $forms_without_captcha ) . '. Click Apply configuration or enable reCAPTCHA on each form.'
+			);
+		} else {
+			$add( 'ok', 'All UM register forms use reCAPTCHA', $register_form_count . ' register form(s) checked.' );
+		}
+
+		$wpforo_auth = get_option( 'wpforo_authorization', array() );
+		if ( ! is_array( $wpforo_auth ) ) {
+			$wpforo_auth = array();
+		}
+		if ( ! empty( $wpforo_auth['user_register'] ) ) {
+			$add( 'error', 'wpForo native registration enabled', 'Turn off “Users can register on forum” in wpForo → Settings → Authorization, or click Apply configuration.' );
+		} else {
+			$add( 'ok', 'wpForo native registration disabled', 'Forum signups should use /join-us/ only.' );
+		}
+
+		$expected_register = trim( (string) ( $config['register_page_slug'] ?? 'join-us' ), '/' ) . '/';
+		$live_register     = isset( $wpforo_auth['register_url'] ) ? (string) $wpforo_auth['register_url'] : '';
+		if ( $live_register && $live_register !== $expected_register ) {
+			$add(
+				'warning',
+				'wpForo register URL mismatch',
+				'Live register URL is "' . $live_register . '" but ShipWiki expects "' . $expected_register . '".'
+			);
+		} elseif ( $live_register ) {
+			$add( 'ok', 'wpForo register URL', 'Points to ' . $live_register . '.' );
+		}
+
+		$c4wp = get_option( 'c4wp_admin_options', array() );
+		if ( ! is_array( $c4wp ) ) {
+			$c4wp = array();
+		}
+		if ( empty( $c4wp['registration'] ) || empty( $c4wp['login'] ) ) {
+			$add( 'warning', 'CAPTCHA 4WP login/registration incomplete', 'Enable registration and login in CAPTCHA 4WP, or click Apply configuration.' );
+		} elseif ( ( $c4wp['pass_on_no_captcha_found'] ?? '' ) !== 'fail' ) {
+			$add( 'warning', 'CAPTCHA 4WP allows missing captcha', 'Set “Pass/fail on missing captcha” to Fail. Click Apply configuration.' );
+		} else {
+			$add( 'ok', 'CAPTCHA 4WP hardened', 'Registration, login, and fail-on-missing are set.' );
+		}
+
+		$tutor = get_option( 'tutor_option', array() );
+		if ( ! is_array( $tutor ) ) {
+			$tutor = maybe_unserialize( $tutor );
+		}
+		if ( ! is_array( $tutor ) ) {
+			$tutor = array();
+		}
+		if ( empty( $tutor['enable_spam_protection'] ) || 'on' !== $tutor['enable_spam_protection'] ) {
+			$add( 'warning', 'Tutor LMS spam protection off', 'Enable fraud/spam protection in Tutor settings or click Apply configuration.' );
+		} else {
+			$locations = $tutor['spam_protection_location'] ?? array();
+			if ( ! is_array( $locations ) ) {
+				$locations = array();
+			}
+			$needed = array( 'tutor_registration', 'wp_registration' );
+			$missing = array_diff( $needed, $locations );
+			if ( ! empty( $missing ) ) {
+				$add(
+					'warning',
+					'Tutor spam protection missing locations',
+					'Enable protection on: ' . implode( ', ', $missing ) . '.'
+				);
+			} else {
+				$add( 'ok', 'Tutor LMS spam protection', 'Enabled on Tutor and WordPress registration.' );
+			}
+		}
+
+		if ( ! get_option( 'users_can_register' ) ) {
+			$add( 'warning', 'WordPress registration disabled', 'Ultimate Member requires Settings → General → “Anyone can register” to be checked.' );
+		} else {
+			$add( 'ok', 'WordPress membership registration enabled', 'Required for Ultimate Member (wp-login.php redirects to /join-us/).' );
+		}
+
+		return $findings;
+	}
+
+	/**
+	 * Render the security audit panel in admin.
+	 *
+	 * @param array<string, mixed> $config Saved config.
+	 */
+	public static function render_security_audit_panel( array $config ) {
+		$findings = self::run_security_audit( $config );
+		$errors   = 0;
+		$warnings = 0;
+		foreach ( $findings as $finding ) {
+			if ( 'error' === $finding['severity'] ) {
+				++$errors;
+			} elseif ( 'warning' === $finding['severity'] ) {
+				++$warnings;
+			}
+		}
+
+		$summary_class = 'notice-success';
+		$summary_text  = 'No registration security issues detected.';
+		if ( $errors > 0 ) {
+			$summary_class = 'notice-error';
+			$summary_text  = sprintf(
+				'%1$d issue(s) need attention before the site is fully protected.',
+				$errors
+			);
+		} elseif ( $warnings > 0 ) {
+			$summary_class = 'notice-warning';
+			$summary_text  = sprintf(
+				'%1$d warning(s). Review recommended.',
+				$warnings
+			);
+		}
+		?>
+		<h2>Registration security audit</h2>
+		<div class="notice <?php echo esc_attr( $summary_class ); ?> inline" style="max-width:720px;padding:10px 12px;margin-bottom:1em;">
+			<p style="margin:0;"><strong><?php echo esc_html( $summary_text ); ?></strong></p>
+		</div>
+		<table class="widefat striped" style="max-width:720px;margin-bottom:1.5em;">
+			<thead>
+				<tr>
+					<th scope="col" style="width:90px;">Status</th>
+					<th scope="col">Check</th>
+					<th scope="col">Details</th>
+				</tr>
+			</thead>
+			<tbody>
+				<?php foreach ( $findings as $finding ) : ?>
+					<?php
+					$badge = 'OK';
+					$color = '#00a32a';
+					if ( 'error' === $finding['severity'] ) {
+						$badge = 'Fix';
+						$color = '#d63638';
+					} elseif ( 'warning' === $finding['severity'] ) {
+						$badge = 'Warn';
+						$color = '#dba617';
+					}
+					?>
+					<tr>
+						<td><strong style="color:<?php echo esc_attr( $color ); ?>;"><?php echo esc_html( $badge ); ?></strong></td>
+						<td><?php echo esc_html( $finding['label'] ); ?></td>
+						<td><?php echo esc_html( $finding['detail'] ); ?></td>
+					</tr>
+				<?php endforeach; ?>
+			</tbody>
+		</table>
+		<?php
 	}
 
 	/**
