@@ -2,7 +2,7 @@
 /**
  * Plugin Name: ShipWiki Membership Setup
  * Description: Applies and enforces registration, forum, and membership settings for shipwiki.net.
- * Version: 1.1.0
+ * Version: 1.2.0
  *
  * @package ShipWiki
  */
@@ -17,7 +17,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 final class ShipWiki_Membership_Setup {
 
 	const OPTION_KEY     = 'shipwiki_membership_config';
-	const CONFIG_VERSION = '1.1.0';
+	const CONFIG_VERSION = '1.2.0';
 	const DELETE_BATCH   = 50;
 
 	/**
@@ -105,7 +105,7 @@ jQuery(function ($) {
 			return;
 		}
 
-		if (!window.confirm('This permanently deletes every user except Administrators. Continue?')) {
+		if (!window.confirm('This permanently deletes every user except Administrators, including their forum posts, topics, and other content. Continue?')) {
 			return;
 		}
 
@@ -271,7 +271,7 @@ JS
 			<hr />
 
 			<h2>Bulk delete fake users</h2>
-			<p>Deletes <strong>all users except Administrators</strong> in batches of <?php echo (int) self::DELETE_BATCH; ?>. Posts/content owned by deleted users are reassigned to the first administrator account.</p>
+			<p>Deletes <strong>all users except Administrators</strong> in batches of <?php echo (int) self::DELETE_BATCH; ?>. Content owned by deleted users is removed entirely — including wpForo forum topics, replies, profiles, activity, and WordPress posts/comments.</p>
 
 			<?php
 			$admin_users      = self::get_administrator_users();
@@ -408,7 +408,6 @@ JS
 		@set_time_limit( 120 );
 
 		$admin_ids = self::get_administrator_user_ids();
-		$reassign  = (int) $admin_ids[0];
 		$user_ids  = self::get_next_deletable_user_ids( self::DELETE_BATCH );
 		$deleted   = 0;
 		$failed    = 0;
@@ -418,8 +417,7 @@ JS
 				continue;
 			}
 
-			$result = wp_delete_user( $user_id, $reassign );
-			if ( $result ) {
+			if ( self::delete_user_and_all_content( $user_id ) ) {
 				++$deleted;
 			} else {
 				++$failed;
@@ -444,6 +442,75 @@ JS
 				'progress'  => min( 100, $progress ),
 			)
 		);
+	}
+
+	/**
+	 * Delete a user and all plugin content (forum posts, WP posts, etc.).
+	 *
+	 * @param int $user_id User ID.
+	 * @return bool
+	 */
+	private static function delete_user_and_all_content( $user_id ) {
+		$user_id = (int) $user_id;
+		if ( $user_id <= 0 ) {
+			return false;
+		}
+
+		self::purge_wpforo_user_content( $user_id );
+
+		// wpForo reads this during WordPress deleted_user to delete rather than reassign.
+		$_REQUEST['wpforo_user_delete_option'] = 'delete';
+
+		// No reassign: WordPress deletes posts and comments authored by the user.
+		$deleted = wp_delete_user( $user_id );
+
+		unset( $_REQUEST['wpforo_user_delete_option'] );
+
+		return (bool) $deleted;
+	}
+
+	/**
+	 * Remove wpForo topics, replies, profile, activity, and related data.
+	 *
+	 * @param int $user_id User ID.
+	 */
+	private static function purge_wpforo_user_content( $user_id ) {
+		if ( ! function_exists( 'WPF' ) ) {
+			return;
+		}
+
+		$wpf = WPF();
+		if ( ! is_object( $wpf ) || ! isset( $wpf->member, $wpf->board, $wpf->db, $wpf->tables ) ) {
+			return;
+		}
+
+		$user_id = (int) $user_id;
+
+		// member->delete() removes the profile and fires wpforo_after_delete_user, which
+		// cascades to topics, posts, reactions, subscriptions, bookmarks, and follows.
+		if ( ! $wpf->member->delete( $user_id, null ) ) {
+			do_action( 'wpforo_after_delete_user', $user_id, null );
+		}
+
+		if ( ! method_exists( $wpf->board, 'get_active_boardids' ) ) {
+			return;
+		}
+
+		$boardids = $wpf->board->get_active_boardids();
+		if ( ! is_array( $boardids ) ) {
+			return;
+		}
+
+		foreach ( $boardids as $boardid ) {
+			$wpf->change_board( $boardid );
+			if ( ! empty( $wpf->tables->activity ) ) {
+				$wpf->db->delete(
+					$wpf->tables->activity,
+					array( 'userid' => $user_id ),
+					array( '%d' )
+				);
+			}
+		}
 	}
 
 	/**
