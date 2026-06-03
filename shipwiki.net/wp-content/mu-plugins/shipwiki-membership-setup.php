@@ -2,7 +2,7 @@
 /**
  * Plugin Name: ShipWiki Membership Setup
  * Description: Applies and enforces registration, forum, and membership settings for shipwiki.net.
- * Version: 1.5.1
+ * Version: 1.5.2
  *
  * @package ShipWiki
  */
@@ -17,7 +17,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 final class ShipWiki_Membership_Setup {
 
 	const OPTION_KEY     = 'shipwiki_membership_config';
-	const CONFIG_VERSION = '1.5.1';
+	const CONFIG_VERSION = '1.5.2';
 	const DELETE_BATCH   = 50;
 
 	/**
@@ -887,10 +887,14 @@ JS
 
 		$config   = self::get_config();
 		$required = self::get_required_registration_status( $config );
+		$paid     = $config['paid_role_slug'] ?? '';
 
 		foreach ( wp_roles()->roles as $slug => $role ) {
 			unset( $role );
 			if ( 'administrator' === $slug ) {
+				continue;
+			}
+			if ( $paid && $slug === $paid ) {
 				continue;
 			}
 
@@ -899,7 +903,8 @@ JS
 				continue;
 			}
 
-			if ( empty( $role_meta['_um_status'] ) || 'approved' === $role_meta['_um_status'] ) {
+			$live = $role_meta['_um_status'] ?? '';
+			if ( empty( $live ) || 'approved' === $live || $live !== $required ) {
 				$role_meta['_um_status'] = $required;
 				update_option( 'um_role_' . $slug . '_meta', $role_meta, false );
 			}
@@ -1322,6 +1327,7 @@ JS
 				$role_meta = array();
 			}
 			$live_status = $role_meta['_um_status'] ?? '';
+			$saved_status = self::get_required_registration_status( $config );
 			if ( 'approved' === $live_status ) {
 				$add(
 					'error',
@@ -1334,11 +1340,11 @@ JS
 					'Ultimate Member role registration status unset',
 					'Role "' . $role_slug . '" has no _um_status. Click Apply configuration or set it manually.'
 				);
-			} elseif ( $live_status !== ( $config['um_registration_status'] ?? '' ) ) {
+			} elseif ( $live_status !== $saved_status ) {
 				$add(
 					'warning',
 					'Ultimate Member role status differs from ShipWiki',
-					'Live role status is "' . $live_status . '" but ShipWiki saved "' . (string) ( $config['um_registration_status'] ?? '' ) . '". Click Apply configuration.'
+					'Live role status is "' . $live_status . '" but ShipWiki enforces "' . $saved_status . '". Runtime protection already uses "' . $saved_status . '"; click Apply configuration to sync Ultimate Member’s stored role (or reload this page after v1.5.1+ auto-repair runs).'
 				);
 			} else {
 				$add( 'ok', 'Ultimate Member role registration status', 'Role "' . $role_slug . '" requires "' . $live_status . '".' );
