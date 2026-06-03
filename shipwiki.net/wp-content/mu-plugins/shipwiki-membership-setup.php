@@ -2,7 +2,7 @@
 /**
  * Plugin Name: ShipWiki Membership Setup
  * Description: Applies and enforces registration, forum, and membership settings for shipwiki.net.
- * Version: 1.3.0
+ * Version: 1.4.0
  *
  * @package ShipWiki
  */
@@ -17,7 +17,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 final class ShipWiki_Membership_Setup {
 
 	const OPTION_KEY     = 'shipwiki_membership_config';
-	const CONFIG_VERSION = '1.3.0';
+	const CONFIG_VERSION = '1.4.0';
 	const DELETE_BATCH   = 50;
 
 	/**
@@ -31,6 +31,14 @@ final class ShipWiki_Membership_Setup {
 		add_action( 'admin_enqueue_scripts', array( __CLASS__, 'enqueue_admin_scripts' ) );
 		add_action( 'wp_ajax_shipwiki_bulk_delete_users', array( __CLASS__, 'ajax_bulk_delete_users' ) );
 		add_action( 'admin_post_shipwiki_flush_um_cache', array( __CLASS__, 'handle_flush_um_cache' ) );
+
+		add_action( 'plugins_loaded', array( __CLASS__, 'repair_um_subscriber_role_meta' ), 20 );
+		add_filter( 'um_change_role_data', array( __CLASS__, 'filter_role_registration_status' ), 999, 2 );
+		add_action( 'um_registration_complete', array( __CLASS__, 'enforce_registration_account_status' ), 5, 3 );
+		add_action( 'um_registration_after_auto_login', array( __CLASS__, 'revoke_session_if_not_approved' ), 1, 1 );
+		add_action( 'user_register', array( __CLASS__, 'enforce_status_on_any_registration' ), 20, 1 );
+		add_filter( 'rest_pre_insert_user', array( __CLASS__, 'block_rest_user_registration' ), 10, 2 );
+		add_filter( 'registration_errors', array( __CLASS__, 'block_unprotected_wp_registration' ), 99, 3 );
 	}
 
 	/**
@@ -177,6 +185,7 @@ JS
 		<div class="wrap">
 			<h1>ShipWiki Membership Setup</h1>
 			<p>Configure registration, Ultimate Member, Tutor LMS, and wpForo in one place. Save your keys first, then click <strong>Apply configuration</strong>.</p>
+			<p><strong>Runtime protection (v1.4+):</strong> New signups are forced to require email activation or admin review even if Ultimate Member role settings were left on auto-approve. Auto-login after register is blocked until approved.</p>
 
 			<?php if ( isset( $_GET['updated'] ) ) : // phpcs:ignore WordPress.Security.NonceVerification.Recommended ?>
 				<div class="notice notice-success is-dismissible"><p>Settings saved.</p></div>
@@ -674,7 +683,7 @@ JS
 		if ( ! is_array( $role_meta ) ) {
 			$role_meta = array();
 		}
-		$role_meta['_um_status'] = $um_status;
+		$role_meta['_um_status'] = self::get_required_registration_status( $config );
 		update_option( 'um_role_' . $wp_role . '_meta', $role_meta, false );
 
 		if ( ! empty( $config['paid_role_slug'] ) ) {
@@ -814,6 +823,203 @@ JS
 	}
 
 	/**
+	 * Registration status enforced for new members (never auto-approve at runtime).
+	 *
+	 * @param array<string, mixed> $config Config.
+	 * @return string pending|checkmail
+	 */
+	private static function get_required_registration_status( array $config ) {
+		$status = $config['um_registration_status'] ?? 'pending';
+		if ( ! in_array( $status, array( 'pending', 'checkmail' ), true ) ) {
+			return 'pending';
+		}
+		return $status;
+	}
+
+	/**
+	 * Fix subscriber role meta if still set to auto-approve (common spam cause).
+	 */
+	public static function repair_um_subscriber_role_meta() {
+		if ( ! function_exists( 'UM' ) ) {
+			return;
+		}
+
+		$config    = self::get_config();
+		$role_slug = $config['default_wp_role'] ?? 'subscriber';
+		$required  = self::get_required_registration_status( $config );
+		$role_meta = get_option( 'um_role_' . $role_slug . '_meta', array() );
+
+		if ( ! is_array( $role_meta ) ) {
+			$role_meta = array();
+		}
+
+		if ( empty( $role_meta['_um_status'] ) || 'approved' === $role_meta['_um_status'] ) {
+			$role_meta['_um_status'] = $required;
+			update_option( 'um_role_' . $role_slug . '_meta', $role_meta, false );
+		}
+	}
+
+	/**
+	 * Override UM role registration status so um_user( 'status' ) is not "approved".
+	 *
+	 * @param array<string, mixed> $role_data Role data.
+	 * @param string               $role_id   Role slug.
+	 * @return array<string, mixed>
+	 */
+	public static function filter_role_registration_status( $role_data, $role_id ) {
+		$config      = self::get_config();
+		$target_role = $config['default_wp_role'] ?? 'subscriber';
+
+		if ( $role_id !== $target_role ) {
+			return $role_data;
+		}
+
+		$role_data['status'] = self::get_required_registration_status( $config );
+		return $role_data;
+	}
+
+	/**
+	 * After UM register: set account to pending or awaiting email (never approved).
+	 *
+	 * @param int                  $user_id   User ID.
+	 * @param array<string, mixed> $args      Form args.
+	 * @param array<string, mixed>|null $form_data Form data.
+	 */
+	public static function enforce_registration_account_status( $user_id, $args, $form_data ) {
+		if ( is_admin() || null === $form_data || ! function_exists( 'UM' ) ) {
+			return;
+		}
+
+		self::apply_account_status_for_user( (int) $user_id, self::get_config() );
+	}
+
+	/**
+	 * Catch Tutor/WP paths that bypass UM role hooks.
+	 *
+	 * @param int $user_id User ID.
+	 */
+	public static function enforce_status_on_any_registration( $user_id ) {
+		if ( ! function_exists( 'UM' ) ) {
+			return;
+		}
+
+		if ( is_admin() && ! wp_doing_ajax() && current_user_can( 'create_users' ) ) {
+			return;
+		}
+
+		$user = get_userdata( $user_id );
+		if ( ! $user ) {
+			return;
+		}
+
+		$config      = self::get_config();
+		$target_role = $config['default_wp_role'] ?? 'subscriber';
+
+		if ( ! in_array( $target_role, (array) $user->roles, true ) ) {
+			return;
+		}
+
+		if ( user_can( $user_id, 'manage_options' ) ) {
+			return;
+		}
+
+		$current = UM()->common()->users()->get_status( $user_id, 'raw' );
+		if ( empty( $current ) || 'approved' === $current ) {
+			self::apply_account_status_for_user( (int) $user_id, $config );
+		}
+	}
+
+	/**
+	 * @param int                  $user_id User ID.
+	 * @param array<string, mixed> $config  Config.
+	 */
+	private static function apply_account_status_for_user( $user_id, array $config ) {
+		if ( $user_id <= 0 || ! function_exists( 'UM' ) ) {
+			return;
+		}
+
+		$status = self::get_required_registration_status( $config );
+
+		if ( 'pending' === $status ) {
+			UM()->common()->users()->set_as_pending( $user_id, true );
+		} else {
+			UM()->common()->users()->send_activation( $user_id, true );
+		}
+
+		UM()->common()->users()->remove_cache( $user_id );
+	}
+
+	/**
+	 * Ultimate Member may auto-login before status is saved; revoke if not approved.
+	 *
+	 * @param int $user_id User ID.
+	 */
+	public static function revoke_session_if_not_approved( $user_id ) {
+		if ( ! function_exists( 'UM' ) ) {
+			return;
+		}
+
+		if ( UM()->common()->users()->has_status( $user_id, 'approved' ) ) {
+			return;
+		}
+
+		wp_clear_auth_cookie();
+		wp_set_current_user( 0 );
+	}
+
+	/**
+	 * Block public REST user creation.
+	 *
+	 * @param object|\WP_Error     $prepared_user Prepared user.
+	 * @param \WP_REST_Request     $request       Request.
+	 * @return object|\WP_Error
+	 */
+	public static function block_rest_user_registration( $prepared_user, $request ) {
+		if ( current_user_can( 'create_users' ) ) {
+			return $prepared_user;
+		}
+
+		return new WP_Error(
+			'shipwiki_rest_registration_blocked',
+			__( 'User registration via REST API is disabled on this site.', 'default' ),
+			array( 'status' => 403 )
+		);
+	}
+
+	/**
+	 * Block native wp-login.php registration unless UM form + captcha present.
+	 *
+	 * @param \WP_Error $errors               Errors.
+	 * @param string    $sanitized_user_login Login.
+	 * @param string    $user_email           Email.
+	 * @return \WP_Error
+	 */
+	public static function block_unprotected_wp_registration( $errors, $sanitized_user_login, $user_email ) {
+		unset( $sanitized_user_login, $user_email );
+
+		if ( is_admin() ) {
+			return $errors;
+		}
+
+		// Ultimate Member register form.
+		if ( ! empty( $_POST['form_id'] ) && ! empty( $_POST['mode'] ) && 'register' === $_POST['mode'] ) { // phpcs:ignore WordPress.Security.NonceVerification.Missing
+			return $errors;
+		}
+
+		// Tutor student/instructor register (must pass Tutor + registration_errors captcha).
+		if ( ! empty( $_POST['tutor_action'] ) && in_array( $_POST['tutor_action'], array( 'tutor_register_student', 'tutor_register_instructor' ), true ) ) { // phpcs:ignore WordPress.Security.NonceVerification.Missing
+			return $errors;
+		}
+
+		$errors->add(
+			'shipwiki_registration_blocked',
+			__( 'Registration is only available through the membership form.', 'default' )
+		);
+
+		return $errors;
+	}
+
+	/**
 	 * Whether current user may use the forum.
 	 */
 	public static function user_can_access_forum() {
@@ -881,8 +1087,19 @@ JS
 		if ( 'approved' === ( $config['um_registration_status'] ?? '' ) ) {
 			$add( 'error', 'ShipWiki set to auto-approve registrations', 'Change Ultimate Member registration status to email activation or admin review.' );
 		} else {
-			$add( 'ok', 'ShipWiki registration status', 'Saved setting: ' . (string) ( $config['um_registration_status'] ?? 'checkmail' ) . '.' );
+			$enforced = self::get_required_registration_status( $config );
+			$add(
+				'ok',
+				'ShipWiki registration status',
+				'Saved: ' . (string) ( $config['um_registration_status'] ?? 'checkmail' ) . '. Runtime enforces: ' . $enforced . '.'
+			);
 		}
+
+		$add(
+			'ok',
+			'Runtime registration lockdown (v1.4)',
+			'Active: overrides auto-approve, blocks REST signup, revokes auto-login for unapproved users.'
+		);
 
 		if ( empty( $config['block_forum_until_approved'] ) ) {
 			$add( 'warning', 'Forum gate disabled in ShipWiki', 'Enable “Block /forum/ until Ultimate Member account is approved” below.' );
@@ -903,7 +1120,7 @@ JS
 				$add(
 					'error',
 					'Ultimate Member role auto-approves new users',
-					'Role "' . $role_slug . '" has Registration status = Auto approve. Change it in Ultimate Member → User Roles.'
+					'Role "' . $role_slug . '" has Registration status = Auto approve. v1.4 runtime override is active, but click Apply configuration to fix the stored role setting.'
 				);
 			} elseif ( empty( $live_status ) ) {
 				$add(
